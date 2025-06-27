@@ -1,2 +1,3 @@
-(lang dune 1.10)
+(lang dune 3.0)
+
 (name pgocaml)

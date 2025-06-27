@@ -1,0 +1,19 @@
+(executable
+ (name test_re)
+ (libraries oUnit pgocaml))
+
+(rule
+ (alias runtest)
+ (deps test_re.exe)
+ (action
+  (run %{deps})))
+
+(executable
+ (name test_pgocaml_lowlevel)
+ (libraries oUnit pgocaml))
+
+(rule
+ (alias runtest)
+ (deps test_pgocaml_lowlevel.exe)
+ (action
+  (run %{deps})))

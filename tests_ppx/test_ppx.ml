@@ -32,7 +32,7 @@ end = struct
   let to_int x = x
 end
 
-let employee_exists dbh ?email n =
+let _employee_exists dbh ?email n =
   [%pgsql dbh "SELECT EXISTS (SELECT 1 FROM employees WHERE name = $n AND email = $?email)"]
 
 let () =

@@ -197,4 +197,4 @@ exception.  Please see the file COPYING.LIB for full license.
 
 ----------------------------------------------------------------------
 
-For an example, please see [tests](https://github.com/darioteixeira/pgocaml/blob/master/tests/test_pgocaml_highlevel.ml)
+For an example, please see [tests](https://github.com/darioteixeira/pgocaml/blob/master/tests_ppx/test_ppx.ml)

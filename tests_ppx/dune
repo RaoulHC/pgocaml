@@ -1,10 +1,12 @@
 (executable
-  (name test_ppx)
-  (preprocessor_deps config.sexp)
-  (libraries oUnit result pgocaml)
-  (preprocess (pps pgocaml_ppx)))
+ (name test_ppx)
+ (preprocessor_deps config.sexp)
+ (libraries oUnit result pgocaml)
+ (preprocess
+  (pps pgocaml_ppx)))
 
-(alias
-  (name runtest)
-  (deps test_ppx.exe)
-  (action (run %{deps})))
+(rule
+ (alias runtest)
+ (deps test_ppx.exe)
+ (action
+  (run %{deps})))
