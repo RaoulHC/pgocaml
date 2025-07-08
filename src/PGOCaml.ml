@@ -21,13 +21,15 @@
 
 module Simple_thread = struct
   type 'a t = 'a
+
   let return x = x
-  let (>>=) v f =  f v
+  let ( >>= ) v f = f v
   let fail = raise
   let catch f fexn = try f () with e -> fexn e
 
   type in_channel = Stdlib.in_channel
   type out_channel = Stdlib.out_channel
+
   let open_connection = Unix.open_connection
   let output_char = output_char
   let output_binary_int = output_binary_int
@@ -40,5 +42,4 @@ module Simple_thread = struct
 end
 
 module M = PGOCaml_generic.Make (Simple_thread)
-
 include M
