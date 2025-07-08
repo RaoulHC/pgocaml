@@ -5,24 +5,37 @@
 ;    (with-stdout-to PGOCaml_config.ml (run ./genconfig.sh))))
 
 (executable
-  (name PGOCaml_genconfig)
-  (preprocess
-    (pps ppx_sexp_conv ppx_deriving.show))
-  (modules PGOCaml_genconfig))
+ (name PGOCaml_genconfig)
+ (preprocess
+  (pps ppx_sexp_conv ppx_deriving.show))
+ (modules PGOCaml_genconfig))
 
 (rule
-  (targets PGOCaml_config.ml)
-  (deps PGOCaml_genconfig.exe)
-  (action
-    (with-stdout-to PGOCaml_config.ml (run ./PGOCaml_genconfig.exe))))
+ (targets PGOCaml_config.ml)
+ (deps PGOCaml_genconfig.exe)
+ (action
+  (with-stdout-to
+   PGOCaml_config.ml
+   (run ./PGOCaml_genconfig.exe))))
 
 (library
-  (name PGOCaml)
-  (public_name pgocaml)
-  (libraries calendar csv hex re rresult sexplib unix camlp-streams
-    (select scram.ml from
-      (base64 digestif -> scram.optional.ml)
-      (-> scram.dummy.ml)))
-  (preprocess (pps ppx_sexp_conv ppx_deriving.show))
-  (wrapped false)
-  (modules scram PGOCaml_aux PGOCaml PGOCaml_generic PGOCaml_config))
+ (public_name pgocaml)
+ (libraries
+  calendar
+  csv
+  hex
+  ppxlib
+  re
+  rresult
+  sexplib
+  unix
+  camlp-streams
+  (select
+   scram.ml
+   from
+   (base64 digestif -> scram.optional.ml)
+   (-> scram.dummy.ml)))
+ (preprocess
+  (pps ppx_sexp_conv ppx_deriving.show ppx_deriving.eq))
+ (wrapped false)
+ (modules scram PGOCaml_aux PGOCaml PGOCaml_generic PGOCaml_config))
