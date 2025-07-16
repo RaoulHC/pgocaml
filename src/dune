@@ -36,6 +36,6 @@
    (base64 digestif -> scram.optional.ml)
    (-> scram.dummy.ml)))
  (preprocess
-  (pps ppx_sexp_conv ppx_deriving.show ppx_deriving.eq))
+  (pps ppxlib.metaquot ppx_sexp_conv ppx_deriving.show ppx_deriving.eq))
  (wrapped false)
- (modules scram PGOCaml_aux PGOCaml PGOCaml_generic PGOCaml_config))
+ (modules scram PGOCaml_aux PGOCaml PGOCaml_generic PGOCaml_config varmap))
