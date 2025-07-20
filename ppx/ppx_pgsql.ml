@@ -259,20 +259,30 @@ let parse_flags flags loc =
     !show,
     !load_custom_from )
 
-let mk_conversions ?load_custom_from ~loc ~dbh results =
+type result_w_conv_fn = {
+  name : string;
+  typ : string;
+  conv_fn : string;
+  nullable : bool;
+}
+
+let results_w_conv_fns ?load_custom_from ~dbh results =
+  let get_conv_fn (result, nullable) =
+    let field_type = result.PGOCaml.field_type in
+    let colnam = result.PGOCaml.name in
+    let typ, conv_fn =
+      match unravel_type dbh ?load_custom_from ~colnam field_type with
+      | nam, None -> (nam, nam ^ "_of_string")
+      | nam, Some (_, deserialize) -> (nam, deserialize)
+    in
+    { name = colnam; typ; conv_fn; nullable }
+  in
+  List.map get_conv_fn results
+
+let mk_conversions ~loc (results : result_w_conv_fn list) =
   List.mapi
-    (fun i (result, nullable) ->
-      let field_type = result.PGOCaml.field_type in
-      let fn =
-        match
-          unravel_type dbh ?load_custom_from ~colnam:result.PGOCaml.name
-            field_type
-        with
-        | nam, None ->
-            let fn = nam ^ "_of_string" in
-            ([%expr PGOCaml.([%e exp_of_string ~loc fn])] [@metaloc loc])
-        | _nam, Some (_, deserialize) -> exp_of_string ~loc deserialize
-      in
+    (fun i { name = _; typ = _; conv_fn; nullable } ->
+      let fn = exp_of_string ~loc conv_fn in
       let col =
         let cname = "c" ^ string_of_int i in
         Exp.ident { txt = Lident cname; loc }
@@ -281,10 +291,12 @@ let mk_conversions ?load_custom_from ~loc ~dbh results =
         ([%expr match [%e col] with Some x -> x | None -> "-"] [@metaloc loc])
       in
       if nullable then
-        (([%expr PGOCaml_aux.Option.map [%e fn] [%e col]] [@metaloc loc]), sconv)
+        ( ([%expr PGOCaml_aux.Option.map PGOCaml.([%e fn]) [%e col]]
+          [@metaloc loc]),
+          sconv )
       else
         ( ([%expr
-             [%e fn]
+             PGOCaml.([%e fn])
                (try PGOCaml_aux.Option.get [%e col]
                 with _ ->
                   failwith
@@ -294,12 +306,12 @@ let mk_conversions ?load_custom_from ~loc ~dbh results =
           sconv ))
     results
 
-let coretype_of_type ~loc ~dbh oid =
+let coretype_of_type ~loc typ =
   let typ =
-    match unravel_type dbh oid with
-    | "timestamp", _ ->
+    match typ with
+    | "timestamp" ->
         Longident.Ldot (Ldot (Lident "CalendarLib", "Calendar"), "t")
-    | nam, _ -> Lident nam
+    | nam -> Lident nam
   in
   {
     ptyp_desc = Ptyp_constr ({ txt = typ; loc }, []);
@@ -338,46 +350,74 @@ let split_query_expr ~loc = function
               option = [%e option];
             }]
 
+type var_w_fn = {
+  varname : string;
+  option : bool;
+  list : bool;
+  conv_fn : string;
+}
+
+type varmap_w_fn = (int, var_w_fn) Hashtbl.t
+
+let map_w_fn ?load_custom_from my_dbh (varmap : Varmap.varmap)
+    (params : PGOCaml.params_description) : varmap_w_fn =
+  let indexed_params =
+    List.combine (range 1 (1 + Hashtbl.length varmap)) params
+  in
+  let varmap_w_fn : varmap_w_fn = Hashtbl.create 8 in
+  List.iter
+    (fun (i, { PGOCaml.param_type }) ->
+      let Varmap.{ varname; option; list } = Hashtbl.find varmap i in
+      let argnam =
+        if String.starts_with varname "{" then None else Some varname
+      in
+      let varname =
+        if String.starts_with varname "{" then
+          String.sub varname 1 (String.length varname - 2)
+        else varname
+      in
+      let varname, typnam =
+        match String.index_opt varname ':' with
+        | None -> (varname, None)
+        | Some _ ->
+            let[@warning "-8"] [ varname; typnam ] =
+              String.split_on_char ':' varname
+            in
+            (varname, Some (String.trim typnam))
+      in
+      let conv_fn =
+        match
+          unravel_type ?load_custom_from ?argnam ?typnam my_dbh param_type
+        with
+        | nam, None -> "string_of_" ^ nam
+        | _, Some (serialize, _) -> serialize
+      in
+      Hashtbl.add varmap_w_fn i { varname; option; list; conv_fn })
+    indexed_params;
+  varmap_w_fn
+
 (* Generate a function for converting the parameters.
  *
  * See also:
  * http://archives.postgresql.org/pgsql-interfaces/2006-01/msg00043.php
  *)
-let param_expr ?load_custom_from ~loc varmap my_dbh (i, { PGOCaml.param_type })
-    =
-  let Varmap.{ varname; list; option } = Hashtbl.find varmap i in
-  let argnam = if String.starts_with varname "{" then None else Some varname in
-  let varname =
-    if String.starts_with varname "{" then
-      String.sub varname 1 (String.length varname - 2)
-    else varname
-  in
-  let varname, typnam =
-    match String.index_opt varname ':' with
-    | None -> (varname, None)
-    | Some _ ->
-        let[@warning "-8"] [ varname; typnam ] =
-          String.split_on_char ':' varname
-        in
-        (varname, Some (String.trim typnam))
-  in
+let param_expr ~loc (varmap : varmap_w_fn) (i, { PGOCaml.param_type = _ }) =
+  let { varname; list; option; conv_fn } = Hashtbl.find varmap i in
   let varname = exp_of_string ~loc varname in
   let varname = { varname with pexp_loc = loc } in
-  let fn =
-    match unravel_type ?load_custom_from ?argnam ?typnam my_dbh param_type with
-    | nam, None ->
-        let fn = exp_of_string ~loc ("string_of_" ^ nam) in
-        ([%expr PGOCaml.([%e fn])] [@metaloc loc])
-    | _, Some (serialize, _) -> exp_of_string ~loc serialize
-  in
+  let fn = exp_of_string ~loc conv_fn in
   match (list, option) with
-  | false, false -> [%expr [ Some ([%e fn] [%e varname]) ]] [@metaloc loc]
+  | false, false ->
+      [%expr PGOCaml.[ Some ([%e fn] [%e varname]) ]] [@metaloc loc]
   | false, true ->
-      [%expr [ PGOCaml_aux.Option.map [%e fn] [%e varname] ]] [@metaloc loc]
+      [%expr PGOCaml.[ PGOCaml_aux.Option.map [%e fn] [%e varname] ]]
+      [@metaloc loc]
   | true, false ->
-      [%expr List.map (fun x -> Some ([%e fn] x)) [%e varname]] [@metaloc loc]
+      [%expr List.map PGOCaml.(fun x -> Some ([%e fn] x)) [%e varname]]
+      [@metaloc loc]
   | true, true ->
-      [%expr List.map (fun x -> PGOCaml_aux.Option.map [%e fn]) [%e varname]]
+      [%expr
+        List.map PGOCaml.(fun x -> PGOCaml_aux.Option.map [%e fn]) [%e varname]]
       [@metaloc loc]
 
 (* General function for constructing lists *)
@@ -409,14 +449,14 @@ let is_nullable f_nullable_results my_dbh result =
       in
       (result, f_nullable_results || not not_nullable)
   (* If we can't figure it out assume it could be nullable *)
-  | _ -> (result, f_nullable_results || true)
+  | _ -> (result, true)
 
-let gen_expr ~loc dbh split params =
+let gen_expr ~loc ~dbh split params =
   let split = construct_list_expr ~loc split_query_expr split in
   ([%expr
      (* let original_query = $str:query$ in * original query string *)
      let dbh = [%e dbh] in
-     let params = [%e params] in
+     let[@warning "-33"] params = [%e params] in
      let split = [%e split] in
      (* split up query *)
      (* Rebuild the query with appropriate placeholders.  A single list
@@ -456,7 +496,7 @@ let mk_res_expr ~loc ~convert ~list og_query =
   [%expr
     let original_query = [%e const_string ~loc og_query] in
     List.rev_map
-      (fun row ->
+      (fun [@warning "-33"] row ->
         match row with
         | [%p list] -> [%e convert]
         | _ ->
@@ -479,22 +519,19 @@ let mk_res_expr ~loc ~convert ~list og_query =
 let bind_exprs ~loc expr return =
   [%expr PGOCaml.bind [%e expr] (fun _rows -> [%e return])] [@metalco loc]
 
-let pgsql_expand_tuple ~loc ?load_custom_from dbh ~varmap ~og_query ~results
+let pgsql_expand_tuple ~loc ~dbh ~(varmap : varmap_w_fn) ~og_query ~results
     ~params =
   let split = Varmap.split og_query in
   let params =
-    construct_list_expr ~loc
-      (param_expr ?load_custom_from varmap dbh)
+    construct_list_expr ~loc (param_expr varmap)
       (List.combine (range 1 (1 + Hashtbl.length varmap)) params)
   in
 
   (* The expression to run the query *)
-  let expr = gen_expr ~loc [%expr dbh] split params in
+  let expr = gen_expr ~loc ~dbh split params in
   let list = mk_listpat ~loc results in
   let convert =
-    let conversions =
-      mk_conversions ?load_custom_from ~loc ~dbh results |> List.map fst
-    in
+    let conversions = mk_conversions ~loc results |> List.map fst in
     (* Avoid generating a single-element tuple. *)
     match conversions with
     | [] -> [%expr ()] [@metaloc loc]
@@ -504,7 +541,97 @@ let pgsql_expand_tuple ~loc ?load_custom_from dbh ~varmap ~og_query ~results
   let res_expr = mk_res_expr ~loc ~convert ~list og_query in
   bind_exprs ~loc expr res_expr
 
-let pgsql_expand ~genobject ?(flags = []) loc dbh og_query =
+let pgsql_expand_object ~loc ~dbh ~show ~varmap ~og_query
+    ~(results : result_w_conv_fn list) ~params =
+  let split = Varmap.split og_query in
+  let params =
+    construct_list_expr ~loc (param_expr varmap)
+      (List.combine (range 1 (1 + Hashtbl.length varmap)) params)
+  in
+
+  (* The expression to run the query *)
+  let expr = gen_expr ~loc ~dbh split params in
+  let list = mk_listpat ~loc results in
+  let fields =
+    List.map
+      (fun { name; typ; nullable; _ } ->
+        (name, coretype_of_type ~loc typ, nullable))
+      results
+  in
+  (* This suppresses unused open warnings, as we don't keep track of the
+     functions provenance *)
+  let attr_33 =
+    {
+      attr_name = { txt = "warning"; loc };
+      attr_loc = loc;
+      attr_payload =
+        PStr
+          [
+            Parsetree.
+              { pstr_desc = Pstr_eval ([%expr "-33"], []); pstr_loc = loc };
+          ];
+    }
+  in
+  let convert =
+    List.fold_left2
+      (fun (lsacc, showacc) (name, _, _) (conv, sconv) ->
+        let hd =
+          {
+            pcf_desc =
+              Pcf_method
+                ({ txt = name; loc }, Public, Cfk_concrete (Fresh, conv));
+            pcf_loc = loc;
+            pcf_attributes = [ attr_33 ];
+          }
+        in
+        let ename = const_string ~loc name in
+        let showacc =
+          ([%expr
+             let fields = ([%e ename], [%e sconv]) :: fields in
+             [%e showacc]]
+          [@metaloc loc])
+        in
+        (hd :: lsacc, showacc))
+      ( [],
+        ([%expr
+           List.fold_left
+             (fun buffer (name, value) ->
+               let () = Buffer.add_string buffer name in
+               let () = Buffer.add_char buffer ':' in
+               let () = Buffer.add_char buffer ' ' in
+               let () = Buffer.add_string buffer value in
+               let () = Buffer.add_char buffer '\n' in
+               buffer)
+             (Buffer.create 16) fields
+           |> Buffer.contents]
+        [@metaloc loc]) )
+      fields
+      (mk_conversions ~loc results)
+    |> fun (fields, fshow) ->
+    let fshow =
+      ([%expr
+         let fields = [] in
+         [%e fshow]]
+      [@metaloc loc])
+    in
+    let fields =
+      match show with
+      | Some txt ->
+          {
+            pcf_desc =
+              Pcf_method ({ txt; loc }, Public, Cfk_concrete (Fresh, fshow));
+            pcf_loc = loc;
+            pcf_attributes = [];
+          }
+          :: fields
+      | None -> fields
+    in
+    Exp.mk (Pexp_object { pcstr_self = Pat.any ~loc (); pcstr_fields = fields })
+  in
+  let res_expr = mk_res_expr ~loc ~convert ~list og_query in
+  bind_exprs ~loc expr res_expr
+
+let pgsql_expand ~genobject ?(flags = []) loc (dbh : expression) og_query =
   let open Rresult in
   let ( key,
         f_execute,
@@ -537,6 +664,8 @@ let pgsql_expand ~genobject ?(flags = []) loc dbh og_query =
     with exn -> loc_raise loc exn
   in
 
+  let varmap_w_fn = map_w_fn ?load_custom_from my_dbh varmap params in
+
   (* If the PGSQL(dbh) "execute" flag was used, we will actually
    * execute the statement now.  Normally this would never be used, but
    * some statements need to be executed, particularly CREATE TEMPORARY
@@ -547,17 +676,19 @@ let pgsql_expand ~genobject ?(flags = []) loc dbh og_query =
   (* Number of params should match length of map, otherwise something
    * has gone wrong in the substitution above.
    *)
-  if Hashtbl.length varmap <> List.length params then
+  if Hashtbl.length varmap_w_fn <> List.length params then
     loc_raise loc
       (Failure
          ("Mismatch in number of parameters found by database. "
         ^ "Most likely your statement contains bare $, $number, etc."));
 
-  (* Construct an expression list for the parameters which expands out any list *)
-
   (* decorate the results with the nullability heuristic *)
   let results' =
     Option.map (List.map (is_nullable f_nullable_results my_dbh)) results
+  in
+
+  let results' =
+    Option.map (results_w_conv_fns ?load_custom_from ~dbh:my_dbh) results'
   in
 
   (* If we're expecting any result rows, then generate a function to
@@ -568,80 +699,9 @@ let pgsql_expand ~genobject ?(flags = []) loc dbh og_query =
   match (genobject, results') with
   (* TODO this gen object stuff could be moved out a bit *)
   | true, Some results ->
-      let params =
-        construct_list_expr ~loc
-          (param_expr ?load_custom_from varmap my_dbh)
-          (List.combine (range 1 (1 + Hashtbl.length varmap)) params)
-      in
-
-      (* The expression to run the query *)
-      let expr = gen_expr ~loc dbh split params in
-      let list = mk_listpat ~loc results in
-      let fields =
-        List.map
-          (fun ({ PGOCaml.name; field_type; _ }, nullable) ->
-            (name, coretype_of_type ~loc ~dbh:my_dbh field_type, nullable))
-          results
-      in
-      let convert =
-        List.fold_left2
-          (fun (lsacc, showacc) (name, _, _) (conv, sconv) ->
-            let hd =
-              {
-                pcf_desc =
-                  Pcf_method
-                    ({ txt = name; loc }, Public, Cfk_concrete (Fresh, conv));
-                pcf_loc = loc;
-                pcf_attributes = [];
-              }
-            in
-            let ename = const_string ~loc name in
-            let showacc =
-              ([%expr
-                 let fields = ([%e ename], [%e sconv]) :: fields in
-                 [%e showacc]]
-              [@metaloc loc])
-            in
-            (hd :: lsacc, showacc))
-          ( [],
-            ([%expr
-               List.fold_left
-                 (fun buffer (name, value) ->
-                   let () = Buffer.add_string buffer name in
-                   let () = Buffer.add_char buffer ':' in
-                   let () = Buffer.add_char buffer ' ' in
-                   let () = Buffer.add_string buffer value in
-                   let () = Buffer.add_char buffer '\n' in
-                   buffer)
-                 (Buffer.create 16) fields
-               |> Buffer.contents]
-            [@metaloc loc]) )
-          fields
-          (mk_conversions ?load_custom_from ~loc ~dbh:my_dbh results)
-        |> fun (fields, fshow) ->
-        let fshow =
-          ([%expr
-             let fields = [] in
-             [%e fshow]]
-          [@metaloc loc])
-        in
-        let fields =
-          match show with
-          | Some txt ->
-              {
-                pcf_desc =
-                  Pcf_method ({ txt; loc }, Public, Cfk_concrete (Fresh, fshow));
-                pcf_loc = loc;
-                pcf_attributes = [];
-              }
-              :: fields
-          | None -> fields
-        in
-        Exp.mk
-          (Pexp_object { pcstr_self = Pat.any ~loc (); pcstr_fields = fields })
-      in
-      let res_expr = mk_res_expr ~loc ~convert ~list query in
-      Ok (bind_exprs ~loc expr res_expr)
+      Ok
+        (pgsql_expand_object ~loc ~show ~dbh ~varmap:varmap_w_fn ~og_query
+           ~results ~params)
   | true, None ->
       Error
         ( "It doesn't make sense to make an object to encapsulate results that \
@@ -649,16 +709,15 @@ let pgsql_expand ~genobject ?(flags = []) loc dbh og_query =
           loc )
   | false, Some results ->
       Ok
-        (pgsql_expand_tuple ~loc ?load_custom_from my_dbh ~varmap ~og_query
-           ~results ~params)
+        (pgsql_expand_tuple ~loc ~dbh ~varmap:varmap_w_fn ~og_query ~results
+           ~params)
   | false, None ->
       let params =
-        construct_list_expr ~loc
-          (param_expr ?load_custom_from varmap my_dbh)
+        construct_list_expr ~loc (param_expr varmap_w_fn)
           (List.combine (range 1 (1 + Hashtbl.length varmap)) params)
       in
       (* The expression to run the query *)
-      let expr = gen_expr ~loc dbh split params in
+      let expr = gen_expr ~loc ~dbh split params in
       Ok (bind_exprs ~loc expr [%expr PGOCaml.return ()])
 
 let expand_sql ~genobject loc dbh extras =
